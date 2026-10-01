@@ -350,3 +350,115 @@ Keys expire after 24 hours.
 2. **`src/passkeykit-connector.ts`**: Wrap `backend.submitWalletCreation` with
    `withIdempotencyKey(backend)` so retries reuse the same key.
 3. **`README.md`**: Document the `Idempotency-Key` header and server obligations.
+
+---
+
+## 14. Body-Hash Binding for the Facilitator Request Signer (#459)
+
+We implement `computeBodyBinding` and `canonicalRequestStringWithBodyHash` inside
+[contrib/x402-request-auth-body-hash.ts](x402-request-auth-body-hash.ts), with tests in
+[contrib/x402-request-auth-body-hash.test.ts](x402-request-auth-body-hash.test.ts).
+
+### What It Does
+- **Binds the body by a SHA-256 content hash** rather than by raw inclusion, so the canonical
+  string is fixed-length and a streaming body can be handled without buffering the whole thing
+  into the signature input.
+- **Distinguishes absent from empty**: an absent body (`undefined`/`null`) produces `"absent:"`,
+  while an empty string produces `"empty:<sha256-of-empty>"`. They must not collide.
+- **Hash**: SHA-256 via the Web Crypto API (browser-safe, no `node:crypto`).
+- **Encoding**: lowercase hex (64 characters).
+- **Conformance vectors**: exact inputs and expected outputs so an independent verifier cannot
+  disagree on the hash or encoding.
+
+### Why Body-by-Value Is a Problem
+The current `canonicalRequestString` in `src/x402-request-auth.ts` (line 114-128) includes the
+body as the 5th newline-joined field. Two bodies that are semantically equivalent but byte-different
+(e.g. different JSON key order) produce different signatures, and any difference in serialisation
+silently breaks verification. The body-hash binding fixes this by hashing the raw bytes.
+
+### Integration into Core
+1. **`src/x402-request-auth.ts`**: Replace `canonicalRequestString` with a version that calls
+   `computeBodyBinding` for the body field. The function becomes `async`.
+2. **`signFacilitatorRequest`** and **`verifyFacilitatorRequest`**: update to use the new async
+   canonical string function.
+3. **`src/x402-request-auth.test.ts`**: add the conformance vectors from this module.
+
+---
+
+## 15. Structured Error Codes Across the SDK Surface (#460)
+
+We implement the error code registry inside [contrib/structured-error-codes.ts](structured-error-codes.ts),
+with tests in [contrib/structured-error-codes.test.ts](structured-error-codes.test.ts).
+
+### What It Does
+- **Adds a stable string code to every exported error class**. Codes are SCREAMING_SNAKE_CASE
+  with a category prefix (e.g. `PAYMENT_MAX_AMOUNT_EXCEEDED`, `WALLET_API_ERROR`).
+- **Codes are stable across releases** — consumers will branch on them. Adding a new code is
+  safe; renaming or removing one is a breaking change.
+- **Cross-checks against `website/content/docs/reference/error-codes.md`**: identifies facilitator-only
+  codes (string codes in JSON body, not SDK classes) and any SDK errors missing from the docs.
+- **`getErrorCode(error)`**: the primary way consumers should read error codes.
+
+### Integration into Core
+1. **Each error class** in `src/`: add a `code` property set to the corresponding value from
+   `ERROR_CODES`. Example:
+   ```ts
+   export class MaxAmountExceededError extends Error {
+     readonly code = "PAYMENT_MAX_AMOUNT_EXCEEDED" as const;
+     // ...
+   }
+   ```
+2. **`src/index.ts`**: export `ERROR_CODES`, `getErrorCode`, and `ErrorCode` type.
+3. **`website/content/docs/reference/error-codes.md`**: add a "SDK Error Codes" section mapping
+   each class to its code.
+
+---
+
+## 16. Watch Mode for `vellar inspect` (#461)
+
+We implement `watchTransaction` and `createHorizonTxStatusReader` inside
+[contrib/inspect-watch-mode.ts](inspect-watch-mode.ts), with tests in
+[contrib/inspect-watch-mode.test.ts](inspect-watch-mode.test.ts).
+
+### What It Does
+- **Uses `waitForTransaction` from `src/tx-status.ts`** — does NOT write a second polling loop.
+- **Polls until the transaction reaches a final state or a timeout**, printing status transitions
+  rather than repeating the same line, so the output is readable when piped to a log.
+- **Supports `--json`**, emitting one line per transition so a script can consume it as a stream.
+- **Exit codes distinguish success (0), failed (1), and timed out (2)**. A timeout is not a
+  failure of the transaction and is not reported as one.
+- **Configurable timeout** with a default of 5 minutes, justified against settlement latency
+  (typically 5-10 seconds on testnet, longer under load).
+
+### Integration into Core
+1. **`packages/cli/src/commands/inspect.ts`**: add `--watch` and `--timeout <ms>` options. When
+   `--watch` is set, call `watchTransaction` instead of the one-shot lookup.
+2. **`packages/cli/src/commands/inspect.test.ts`**: add tests for the watch mode, including
+   timeout behavior and exit codes.
+
+---
+
+## 17. Facilitator Capability Probe (#462)
+
+We implement `probeFacilitator`, `checkCapabilityMismatches`, and formatting helpers inside
+[contrib/facilitator-capability-probe.ts](facilitator-capability-probe.ts), with tests in
+[contrib/facilitator-capability-probe.test.ts](facilitator-capability-probe.test.ts).
+
+### What It Does
+- **Queries the facilitator** for its supported networks, schemes, and fee-sponsorship posture,
+  without signing anything or reading a key.
+- **Compares the result against local configuration** and reports mismatches plainly. A facilitator
+  settling on testnet against a mainnet configuration is the error this catches early.
+- **Treats every field as untrusted seller-controlled data**, following the discipline in
+  `src/x402-untrusted.ts`.
+- **Returns null when the facilitator does not expose a capability endpoint**, rather than
+  inferring capability from a 402.
+- **Shared implementation** for both SDK and CLI.
+
+### Integration into Core
+1. **New SDK module** (`src/facilitator-capabilities.ts`): move the implementation from contrib,
+   export `probeFacilitator`, `checkCapabilityMismatches`, `FacilitatorCapabilities`, and
+   `CapabilityMismatch`.
+2. **`src/index.ts`**: export the new module.
+3. **`packages/cli/src/commands/`**: add a `capabilities` command that calls `probeFacilitator`
+   and formats the output (text and `--json` modes).
